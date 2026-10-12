@@ -161,7 +161,8 @@ def test_builtin_suite_budget_is_consumed(
 
         # meta_json.budget 段：套件声明 + 实际累计 + 未触发封顶
         meta = json.loads(ev.meta_json)
-        assert meta["budget"]["suite_total_cap"] == 200_000
+        assert meta["budget"]["requested_suite_total_cap"] == 200_000
+        assert meta["budget"]["suite_total_cap"] == meta["budget"]["generation_flow_remaining_at_start"]
         assert meta["budget"]["used_tokens"] > 0
         assert meta["budget"]["cap_hit"] is False
 
@@ -310,18 +311,66 @@ def test_eval_result_view_exposes_budget_scope_and_actual_tokens(
               .order_by(EvalRun.created_at.desc()).first())
         assert ev is not None
         view = eval_run_view(s, ev)
-        assert view["budget"]["suite_total_cap"] == 200_000
+        assert view["budget"]["requested_suite_total_cap"] == 200_000
+        assert view["budget"]["suite_total_cap"] == view["budget"]["generation_flow_remaining_at_start"]
         assert view["budget"]["used_tokens"] > 0
         assert view["budget"]["cap_hit"] is False
-        assert "judge" in view["budget"]["suite_cap_scope"]
+        assert view["budget"]["suite_cap_scope"] == "candidate_baseline_and_judge"
         assert view["cost"]["candidate_tokens"] > 0
         assert view["cost"]["baseline_tokens"] > 0
         from app.generation.delivery import _evaluation_usage_receipt
         receipt_usage = _evaluation_usage_receipt(s, vid)
         contrast = next(item for item in receipt_usage if item["kind"] == "contrast")
-        assert contrast["budget"]["suite_total_cap"] == 200_000
+        assert contrast["budget"]["suite_total_cap"] < 200_000
         assert contrast["cost"]["candidate_tokens"] > 0
         assert contrast["cost"]["baseline_tokens"] > 0
+
+
+def test_eval_suite_cap_includes_blind_judge_usage(
+    migrated_db: Any, client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A complete suite cap includes judge tokens, not only candidate/baseline."""
+    from app.workers.handlers import eval_run as handler
+
+    class JudgeProvider:
+        @property
+        def capabilities(self) -> Any:
+            from app.llm import Capabilities
+            return Capabilities(tools=False, streaming=False, json_mode=True,
+                                max_context_tokens=100_000)
+
+        def complete(self, messages: list[Any], **_kw: Any) -> Any:
+            return ModelResponse(
+                content=json.dumps({
+                    "preference": "a", "attribution": "REQ-1: 行动项整理",
+                }),
+                usage=Usage(2_000, 100), finish_reason="stop",
+            )
+
+    monkeypatch.setattr(handler, "judge_provider_factory", JudgeProvider)
+    agent = GreedyAgentProvider()
+    vid = _run_chain(client, monkeypatch, agent)
+
+    from app.models import EvalRun
+    with Session(create_db_engine(db_path(load_config()))) as s:
+        ev = (s.query(EvalRun)
+              .filter(EvalRun.version_id == vid, EvalRun.kind != "trigger")
+              .order_by(EvalRun.created_at.desc()).first())
+        assert ev is not None
+        meta = json.loads(ev.meta_json)
+        budget = meta["budget"]
+        judge_tokens = 2_100 * len(meta["blind"]["verdicts"])
+        assert budget["judge_tokens"] == judge_tokens
+        assert budget["used_tokens"] == budget["candidate_baseline_tokens"] + judge_tokens
+        assert budget["suite_cap_scope"] == "candidate_baseline_and_judge"
+        from app.generation.flow import get_flow
+        from app.models import SkillVersion
+        version = s.get(SkillVersion, vid)
+        flow = get_flow(s, version.generation_flow_id)
+        ledger = flow.checkpoint["budget_ledger"]
+        stages = {entry.get("stage_id") for entry in ledger.values()}
+        assert {"eval", "eval-blind"}.issubset(stages)
+        assert flow.budget.used_tokens >= budget["cap_accounted_tokens"]
 
 
 @pytest.mark.parametrize("total_cap", [1_000, 50_000])

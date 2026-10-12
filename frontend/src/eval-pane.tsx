@@ -258,13 +258,13 @@ export function EvalPane({ projectId }: { projectId: string }) {
             style={{ display: "block", padding: 6, width: 190 }} />
         </label>
         <label>
-          套件累计 token 上限（候选 + 基线，空白使用测试集声明/不限额）
+          套件累计 token 上限（候选 + 基线 + 评委，空白使用测试集声明/不限额）
           <input type="number" min={100} max={100000000} step={1000} value={suiteMaxTokensTotal}
             onChange={(e) => setSuiteMaxTokensTotal(e.target.value)} placeholder="使用声明/不限额"
             style={{ display: "block", padding: 6, width: 220 }} />
         </label>
         <p style={{ color: "#777", maxWidth: 420, margin: "18px 0 0" }}>
-          明确输入的上限会覆盖测试集声明，既可调高也可调低。盲评评委在候选/基线执行后运行，单独计量，不占用套件累计上限。
+          明确输入的上限会覆盖测试集声明，既可调高也可调低。评委提示过长时，输入 token 仍可能造成一笔可见超额。
         </p>
       </div>
 
@@ -326,13 +326,13 @@ function EvalResultDetail({ view }: { view: EvalRunView }) {
         <b>预算与用量</b>
         <div>
           单次运行上限：{formatBudgetLimits(view.budget?.per_run_limits_by_case)}；套件累计上限：{formatTokens(view.budget?.suite_total_cap)}；
-          候选/基线实测用量：{formatTokens(view.budget?.used_tokens ?? ((view.cost?.candidate_tokens ?? 0) + (view.cost?.baseline_tokens ?? 0)))}
+          套件累计用量（候选/基线/评委，含估算）：{formatTokens(view.budget?.cap_accounted_tokens ?? view.budget?.used_tokens ?? view.cost?.total_tokens)}
           {view.budget?.unknown_usage_estimated_tokens ? `；无 usage 失败调用保守估算 ${formatTokens(view.budget.unknown_usage_estimated_tokens)}` : ""}
-          {view.budget?.cap_hit ? "（已触发上限，后续用例已跳过）" : "（未触发上限）"}
+          {view.budget?.cap_hit ? "（已触发上限，后续运行或评委调用已跳过）" : "（未触发上限）"}
         </div>
         <div>
           实际用量明细：候选 {formatTokens(view.cost?.candidate_tokens)} · 基线 {formatTokens(view.cost?.baseline_tokens)} ·
-          评委 {formatTokens(view.cost?.judge_tokens)}（单独计量，不计入套件上限）
+          评委 {formatTokens(view.cost?.judge_tokens)}（计入套件累计上限）
           {(view.blind?.usage_missing_calls ?? 0) > 0 && `；评委有 ${view.blind?.usage_missing_calls} 次调用未返回 token 用量，费用统计不完整`}
           {view.blind?.budget_ledger_error ? `；评委成本台账写入失败：${view.blind.budget_ledger_error}` : ""}
         </div>

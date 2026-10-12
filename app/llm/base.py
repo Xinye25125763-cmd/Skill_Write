@@ -71,7 +71,7 @@ class ModelResponse:
 
     content: str | None = None
     tool_calls: list[ToolCall] = field(default_factory=list)
-    usage: Usage = field(default_factory=Usage)
+    usage: Usage | None = field(default_factory=Usage)
     finish_reason: str | None = None
 
 

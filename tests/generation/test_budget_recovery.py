@@ -72,6 +72,31 @@ def _flow_in_db(migrated_db: Path) -> str:
         return snap.flow_id
 
 
+def test_usage_tracking_provider_caps_each_output_and_stops_later_calls() -> None:
+    from app.llm.usage import ModelTokenBudgetExceeded, UsageTrackingProvider
+
+    class Provider:
+        capabilities = Capabilities(tools=False, streaming=False, json_mode=True,
+                                    max_context_tokens=10_000)
+
+        def __init__(self) -> None:
+            self.max_tokens: list[int | None] = []
+
+        def complete(self, messages, **kwargs):  # noqa: ANN001, ANN201
+            self.max_tokens.append(kwargs.get("max_tokens"))
+            return ModelResponse(content="ok", usage=Usage(70, 40))
+
+    raw = Provider()
+    provider = UsageTrackingProvider(raw, max_tokens_total=100)
+    provider.complete([])
+    assert raw.max_tokens == [100]
+    assert provider.used_tokens == 110  # prompt tokens can overrun an in-flight call
+    assert provider.meta()["overrun_tokens"] == 10
+    with pytest.raises(ModelTokenBudgetExceeded):
+        provider.complete([])
+    assert raw.max_tokens == [100], "额度耗尽后不应向底层 provider 再发请求"
+
+
 # ---------- 验收 1+3：累计 / 不重记 / 未知不免费（单元级） ----------
 
 

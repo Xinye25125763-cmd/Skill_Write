@@ -72,8 +72,9 @@ export interface EvalRunView {
     cap_accounted_tokens?: number;
     unknown_usage_estimated_tokens?: number;
     usage_missing_calls?: number;
-    suite_cap_scope: string;
-    judge_tokens_excluded: number | null;
+    suite_cap_scope?: string;
+    candidate_baseline_tokens?: number;
+    judge_tokens?: number;
   } | null;
   blind?: {
     usage_missing_calls?: number;

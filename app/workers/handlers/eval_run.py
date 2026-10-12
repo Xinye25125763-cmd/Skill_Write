@@ -59,6 +59,20 @@ class _UsageTrackingProvider:
             self.completion_tokens += int(usage.completion_tokens or 0)
         return response
 
+
+class _OutputCappedProvider:
+    """Apply an output-token allowance to a provider call when one is known."""
+
+    def __init__(self, provider, max_tokens: int | None) -> None:  # noqa: ANN001
+        self.provider = provider
+        self.max_tokens = max_tokens
+
+    def complete(self, messages, **kwargs):  # noqa: ANN001
+        if self.max_tokens is not None:
+            requested = kwargs.get("max_tokens")
+            kwargs["max_tokens"] = min(self.max_tokens, requested) if requested else self.max_tokens
+        return self.provider.complete(messages, **kwargs)
+
 # 基础设施类异常：job 级失败（不属单例兑底范围）
 INFRA_ERRORS = (ProviderNotConfigured,)
 try:  # VersionNotFound 在 agent_run 模块内定义
@@ -153,9 +167,10 @@ def eval_run_view(session, ev: EvalRun) -> dict:  # noqa: ANN001
         cost["baseline_tokens"] = sum(
             (r.prompt_tokens or 0) + (r.completion_tokens or 0)
             for r in runs if r.version_id is None)
-    judge_meta = (_blind_of(ev) or {}).get("usage") or {}
-    cost["judge_tokens"] = int(judge_meta.get("prompt_tokens") or 0) + int(
-        judge_meta.get("completion_tokens") or 0)
+    judge_meta = _blind_of(ev) or {}
+    judge_usage = judge_meta.get("usage_observed") or judge_meta.get("usage") or {}
+    cost["judge_tokens"] = int(judge_usage.get("prompt_tokens") or 0) + int(
+        judge_usage.get("completion_tokens") or 0)
     cost["total_tokens"] = (
         cost["candidate_tokens"] + cost["baseline_tokens"] + cost["judge_tokens"])
 
@@ -245,8 +260,23 @@ def handle(session, cfg, job, ctx: HandlerContext) -> dict:  # noqa: ANN001
     cases = json.loads(suite.cases_json)
 
     # 预算优先级：API 显式值 > 用例声明 > 套件声明 > 执行器默认。
-    # judge 在候选/基线执行循环之后运行，单独计量，不消耗 suite cap。
+    # 套件累计 cap 覆盖候选、基线和盲评 judge。
     max_tokens_per_run, suite_total_cap, case_limits = _resolve_budget_limits(cases, payload)
+    requested_suite_cap = suite_total_cap
+    flow_id = None
+    flow_remaining_cap = None
+    if version_id:
+        from app.models import SkillVersion
+        version = session.get(SkillVersion, version_id)
+        flow_id = version.generation_flow_id if version is not None else None
+    if flow_id:
+        flow_snap = budget_svc.flow_store.get_flow(session, flow_id)
+        flow_cap = (flow_snap.budget.max_tokens_total
+                    if flow_snap.budget.max_tokens_total is not None
+                    else flow_snap.budget.total_tokens)
+        flow_remaining_cap = max(0, flow_cap - flow_snap.budget.used_tokens)
+        suite_total_cap = (flow_remaining_cap if suite_total_cap is None
+                           else min(suite_total_cap, flow_remaining_cap))
 
     ev = EvalRun(
         id=new_ulid(),
@@ -272,6 +302,10 @@ def handle(session, cfg, job, ctx: HandlerContext) -> dict:  # noqa: ANN001
     done = 0
     used_total_tokens = 0  # suite cap 计账：实测 tokens + 未知 usage 的保守预留
     known_total_tokens = 0
+    candidate_baseline_tokens = 0
+    candidate_baseline_prompt_tokens = 0
+    candidate_baseline_completion_tokens = 0
+    candidate_baseline_model_calls = 0
     unknown_usage_estimated_tokens = 0
     usage_missing_calls = 0
     suite_cap_hit = False
@@ -383,6 +417,10 @@ def handle(session, cfg, job, ctx: HandlerContext) -> dict:  # noqa: ANN001
                                    ((run.prompt_tokens or 0) + (run.completion_tokens or 0)))
                 estimated_tokens = int(run_budget.get("unknown_usage_estimated_tokens") or 0)
                 known_total_tokens += known_tokens
+                candidate_baseline_tokens += known_tokens
+                candidate_baseline_prompt_tokens += int(run.prompt_tokens or 0)
+                candidate_baseline_completion_tokens += int(run.completion_tokens or 0)
+                candidate_baseline_model_calls += int(run_budget.get("model_calls") or 0)
                 unknown_usage_estimated_tokens += estimated_tokens
                 usage_missing_calls += int(run_budget.get("usage_missing_calls") or 0)
                 used_total_tokens += known_tokens + estimated_tokens
@@ -431,6 +469,7 @@ def handle(session, cfg, job, ctx: HandlerContext) -> dict:  # noqa: ANN001
         "usage_calls": 0,
         "usage_missing_calls": 0,
     }
+    judge_tokens = 0
     try:
         judge = _UsageTrackingProvider(judge_provider_factory())
     except ProviderNotConfigured as exc:
@@ -439,11 +478,6 @@ def handle(session, cfg, job, ctx: HandlerContext) -> dict:  # noqa: ANN001
     if judge is not None:
         # 生成链内建评测 → 盲评调用入预算台账（版本行携带生成流程 ID；
         # 对话入口发起的评测无关联 flow → 不记，调用数仍入 meta 可见）
-        flow_id = None
-        if version_id:
-            from app.models import SkillVersion
-            vrow = session.get(SkillVersion, version_id)
-            flow_id = vrow.generation_flow_id if vrow is not None else None
         rng = random.Random()
         for case in cases:
             case_id = str(case.get("id") or "")
@@ -452,13 +486,31 @@ def handle(session, cfg, job, ctx: HandlerContext) -> dict:  # noqa: ANN001
             base_msg = pair.get("baseline")
             if not (cand_msg and base_msg):
                 continue  # 双侧输出不齐全 → 不盲评（不粉饰）
+            if suite_total_cap is not None and used_total_tokens >= suite_total_cap:
+                suite_cap_hit = True
+                blind_verdicts.append({
+                    "case_id": case_id,
+                    "preference": None,
+                    "attribution": "",
+                    "attribution_ok": False,
+                    "skipped": "套件整体 token 封顶已达，未调用评审模型",
+                })
+                continue
             text_a, text_b, cand_is_a = blind_mod.blind_pair(rng, cand_msg, base_msg)
             verdict: dict = {
                 "case_id": case_id, "candidate_is_a": cand_is_a,
             }
+            calls_before = judge.calls
+            known_before = judge.prompt_tokens + judge.completion_tokens
+            missing_before = judge.usage_missing_calls
             try:
+                # Judge 单次调用前无法准确知道 prompt token 数；输出预算
+                # 受 suite 剩余额度约束。prompt 过长仍可能产生一次可见超额。
+                judge_cap = (None if suite_total_cap is None else
+                             max(1, suite_total_cap - used_total_tokens))
+                bounded_judge = _OutputCappedProvider(judge, judge_cap)
                 v, jmeta = blind_mod.judge_blind(
-                    judge, prompts.get(case_id, ""), text_a, text_b,
+                    bounded_judge, prompts.get(case_id, ""), text_a, text_b,
                 )
                 verdict.update(v)
                 verdict["attribution_ok"] = blind_mod.verify_attribution(
@@ -468,6 +520,23 @@ def handle(session, cfg, job, ctx: HandlerContext) -> dict:  # noqa: ANN001
                 verdict.update({"preference": None, "attribution": "",
                                 "attribution_ok": False,
                                 "error": f"{type(exc).__name__}: {exc}"})
+            calls_delta = judge.calls - calls_before
+            known_delta = judge.prompt_tokens + judge.completion_tokens - known_before
+            missing_delta = judge.usage_missing_calls - missing_before
+            estimate_delta = 0
+            if missing_delta and suite_total_cap is not None:
+                # Missing usage cannot be treated as free; conservatively reserve
+                # the remaining suite allowance and stop subsequent judge calls.
+                estimate_delta = max(0, suite_total_cap - used_total_tokens)
+            known_total_tokens += known_delta
+            unknown_usage_estimated_tokens += estimate_delta
+            judge_tokens += known_delta + estimate_delta
+            used_total_tokens += known_delta + estimate_delta
+            usage_missing_calls += missing_delta
+            if suite_total_cap is not None and used_total_tokens >= suite_total_cap:
+                suite_cap_hit = True
+            if estimate_delta:
+                verdict["usage_estimated_tokens"] = estimate_delta
             blind_verdicts.append(verdict)
     if judge is not None:
         judge_meta_total.update({
@@ -481,6 +550,9 @@ def handle(session, cfg, job, ctx: HandlerContext) -> dict:  # noqa: ANN001
             "usage_calls": judge.usage_calls,
             "usage_missing_calls": judge.usage_missing_calls,
         })
+        judge_meta_total["unknown_usage_estimated_tokens"] = sum(
+            int(v.get("usage_estimated_tokens") or 0) for v in blind_verdicts
+        )
     blind_meta = {
         "verdicts": blind_verdicts,
         "summary": blind_mod.blind_summary(blind_verdicts),
@@ -506,18 +578,47 @@ def handle(session, cfg, job, ctx: HandlerContext) -> dict:  # noqa: ANN001
             str(c.get("id") or ""): case_limits[i] for i, c in enumerate(cases)
         },
         "suite_total_cap": suite_total_cap,
+        "requested_suite_total_cap": requested_suite_cap,
+        "generation_flow_remaining_at_start": flow_remaining_cap,
         "used_tokens": known_total_tokens,
+        "candidate_baseline_tokens": candidate_baseline_tokens,
+        "judge_tokens": judge_tokens if judge is not None else 0,
         "cap_accounted_tokens": used_total_tokens,
         "unknown_usage_estimated_tokens": unknown_usage_estimated_tokens,
         "usage_missing_calls": usage_missing_calls,
         "cap_hit": suite_cap_hit,
-        "suite_cap_scope": "candidate_and_baseline_only; judge is reported separately",
-        "judge_tokens_excluded": int(judge_meta_total.get("usage", {}).get("prompt_tokens") or 0)
-            + int(judge_meta_total.get("usage", {}).get("completion_tokens") or 0)
-            if isinstance(judge_meta_total.get("usage"), dict) else None,
+        "suite_cap_scope": "candidate_baseline_and_judge",
     }
     ev.meta_json = json.dumps({"blind": blind_meta, "budget": budget_meta},
                               ensure_ascii=False)
+
+    if flow_id and (candidate_baseline_model_calls or candidate_baseline_tokens
+                    or unknown_usage_estimated_tokens):
+        eval_attempt_id = f"{job.id}:{int(job.attempt or 1)}"
+        try:
+            budget_svc.reserve_stage_budget(
+                session, flow_id, "eval", amount=0, attempt_id=eval_attempt_id,
+            )
+            budget_svc.record_stage_usage(
+                session, flow_id, "eval", {
+                    "prompt_tokens": candidate_baseline_prompt_tokens,
+                    "completion_tokens": candidate_baseline_completion_tokens,
+                    "model_calls": candidate_baseline_model_calls,
+                    "usage_missing_calls": usage_missing_calls - judge_meta_total["usage_missing_calls"],
+                    "unknown_usage_estimated_tokens": max(
+                        0, unknown_usage_estimated_tokens - int(
+                            judge_meta_total.get("unknown_usage_estimated_tokens") or 0
+                        ),
+                    ),
+                }, attempt_id=eval_attempt_id,
+            )
+        except Exception as exc:  # noqa: BLE001: persist incomplete cross-stage accounting
+            session.rollback()
+            ev = session.get(EvalRun, ev.id)
+            budget_meta["budget_ledger_error"] = f"{type(exc).__name__}: {exc}"
+            ev.meta_json = json.dumps({"blind": blind_meta, "budget": budget_meta},
+                                      ensure_ascii=False)
+            session.commit()
 
     # 预算：评审调用全进台账（stage_id=eval-blind，预留+实际双写；
     # 同 stage_id 不重记；台账失败不拖垮已完成的评测）

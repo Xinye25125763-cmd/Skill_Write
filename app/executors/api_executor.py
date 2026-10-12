@@ -227,12 +227,19 @@ class ApiExecutor:
                 self.unknown_usage_estimated_tokens += request_token_reservation
                 raise
             duration_ms = int((time.monotonic() - started) * 1000)
-            self.budget.consume(resp.usage)
-            total = Usage(
-                prompt_tokens=total.prompt_tokens + resp.usage.prompt_tokens,
-                completion_tokens=total.completion_tokens + resp.usage.completion_tokens,
-            )
-            self.total_usage = total
+            if resp.usage is None:
+                # Missing provider usage is unknown, not a measured zero. Charge
+                # the reserved completion allowance so later tool cycles stop.
+                self.usage_missing_calls += 1
+                self.unknown_usage_estimated_tokens += request_token_reservation
+                self.budget.consume(Usage(completion_tokens=request_token_reservation))
+            else:
+                self.budget.consume(resp.usage)
+                total = Usage(
+                    prompt_tokens=total.prompt_tokens + resp.usage.prompt_tokens,
+                    completion_tokens=total.completion_tokens + resp.usage.completion_tokens,
+                )
+                self.total_usage = total
 
             model_step = StepRecord(
                 kind="model",

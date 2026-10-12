@@ -137,14 +137,19 @@ class OpenAICompatProvider:
                 args = {"_raw": args_raw}
             tool_calls.append(ToolCall(id=tc.get("id") or "", name=fn.get("name") or "", arguments=args))
 
-        u = data.get("usage") or {}
+        u = data.get("usage")
+        usage = None
+        if isinstance(u, dict) and (
+            "prompt_tokens" in u or "completion_tokens" in u
+        ):
+            usage = Usage(
+                prompt_tokens=int(u.get("prompt_tokens") or 0),
+                completion_tokens=int(u.get("completion_tokens") or 0),
+            )
         return ModelResponse(
             content=message.get("content"),
             tool_calls=tool_calls,
-            usage=Usage(
-                prompt_tokens=int(u.get("prompt_tokens") or 0),
-                completion_tokens=int(u.get("completion_tokens") or 0),
-            ),
+            usage=usage,
             finish_reason=choice.get("finish_reason"),
         )
 

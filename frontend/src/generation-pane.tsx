@@ -39,6 +39,7 @@ export function GenerationPane({ projectId, pollMs = 1500 }: {
   pollMs?: number;
 }) {
   const [requestText, setRequestText] = useState("");
+  const [maxTokensTotal, setMaxTokensTotal] = useState("");
   const [flow, setFlow] = useState<GenerationFlowView | null>(null);
   const [receipt, setReceipt] = useState<DeliveryReceiptView | null>(null);
   const [answer, setAnswer] = useState("");
@@ -117,7 +118,12 @@ export function GenerationPane({ projectId, pollMs = 1500 }: {
     try {
       const snap = await api<GenerationFlowView>(
         `/api/projects/${projectId}/generation-flows`,
-        { method: "POST", body: JSON.stringify({ request_text: requestText }) },
+        { method: "POST", body: JSON.stringify({
+          request_text: requestText,
+          ...(maxTokensTotal.trim()
+            ? { budget: { max_tokens_total: Number(maxTokensTotal) } }
+            : {}),
+        }) },
       );
       localStorage.setItem(`${FLOW_KEY}:${projectId}`, snap.flow_id);
       setFlow(snap);
@@ -196,6 +202,12 @@ export function GenerationPane({ projectId, pollMs = 1500 }: {
             onChange={(e) => setRequestText(e.target.value)}
             style={{ width: "100%", fontFamily: "monospace", fontSize: 13 }}
           />
+          <label style={{ display: "block", marginTop: 8, color: "#666", fontSize: 13 }}>
+            全流程 token 上限（空白使用默认 200,000）
+            <input type="number" min={0} max={100000000} step={1000}
+              value={maxTokensTotal} onChange={(e) => setMaxTokensTotal(e.target.value)}
+              placeholder="200000" style={{ display: "block", marginTop: 4, padding: 6, width: 200 }} />
+          </label>
           <button
             style={{ marginTop: 8 }}
             disabled={!requestText.trim()}
@@ -240,7 +252,7 @@ export function GenerationPane({ projectId, pollMs = 1500 }: {
           {/* 费用（预算台账证据） */}
           {flow.budget ? (
             <p style={{ color: "#666" }}>
-              已用：{flow.budget.used_tokens} tokens · {flow.budget.used_model_calls} 次模型调用
+              已用：{flow.budget.used_tokens} / {flow.budget.max_tokens_total ?? flow.budget.total_tokens ?? 200000} tokens · {flow.budget.used_model_calls} 次模型调用
               {flow.budget.estimated_tokens ? ` · 估算 ${flow.budget.estimated_tokens} tokens` : ""}
               {flow.budget.unknown_usage_calls ? ` · ${flow.budget.unknown_usage_calls} 次调用 usage 未知` : ""}
             </p>
@@ -335,13 +347,13 @@ export function GenerationPane({ projectId, pollMs = 1500 }: {
                       <li key={item.eval_run_id}>
                         {item.kind === "contrast" ? "对照评测" : "触发验证"}：
                         {item.kind === "contrast" ? (
-                          <>单次上限 {formatReceiptLimit(item.budget.per_run_limits_by_case)}；整套上限 {formatReceiptTokens(item.budget.suite_total_cap)}；
+                          <>单次上限 {formatReceiptLimit(item.budget.per_run_limits_by_case)}；整套/流程剩余上限 {formatReceiptTokens(item.budget.suite_total_cap)}；
                             实测 {formatReceiptTokens(item.budget.actual_tokens)}；估算 {formatReceiptTokens(item.budget.unknown_usage_estimated_tokens)}；
-                            {item.budget.cap_hit ? "已触顶" : "未触顶"}；候选 {formatReceiptTokens(item.cost.candidate_tokens)}、基线 {formatReceiptTokens(item.cost.baseline_tokens)}、评委 {formatReceiptTokens(item.cost.judge_tokens)}（评委单独计量，未知用量估算 {formatReceiptTokens(item.budget.judge_unknown_usage_estimated_tokens)}）
+                            {item.budget.cap_hit ? "已触顶" : "未触顶"}；候选 {formatReceiptTokens(item.cost.candidate_tokens)}、基线 {formatReceiptTokens(item.cost.baseline_tokens)}、评委 {formatReceiptTokens(item.cost.judge_tokens)}（未知用量估算 {formatReceiptTokens(item.budget.judge_unknown_usage_estimated_tokens)}）
                             {item.budget.budget_ledger_error ? `；成本台账写入错误：${item.budget.budget_ledger_error}` : ""}
                             {Number(item.cost.judge_usage_missing_calls ?? 0) > 0 && `；评委有 ${item.cost.judge_usage_missing_calls} 次调用用量未知`}</>
                         ) : (
-                          <>实测 {formatReceiptTokens(item.budget.actual_tokens)}；未知调用 {String(item.budget.usage_missing_calls ?? 0)}；未知用量估算 {formatReceiptTokens(item.budget.unknown_usage_estimated_tokens)}；触发验证独立于对照评测预算
+                          <>实测 {formatReceiptTokens(item.budget.actual_tokens)}；未知调用 {String(item.budget.usage_missing_calls ?? 0)}；未知用量估算 {formatReceiptTokens(item.budget.unknown_usage_estimated_tokens)}；触发验证作为独立阶段计入全流程预算
                             {item.budget.budget_ledger_error ? `；成本台账写入错误：${item.budget.budget_ledger_error}` : ""}</>
                         )}
                       </li>

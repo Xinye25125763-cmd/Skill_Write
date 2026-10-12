@@ -25,6 +25,7 @@ from typing import Any
 import yaml
 
 from app.llm.base import ChatMessage, ModelProvider
+from app.llm.usage import ModelTokenBudgetExceeded
 
 # 触发验证参数（需求文档 §2.3；测试可传小值覆盖）
 TRIGGER_CASES_TOTAL = 20
@@ -313,9 +314,14 @@ def run_trigger_verification(
         selections: dict[str, str | None] = {}
         n = 0
         for c in cases:
-            sel, k = judge_trigger(
-                provider, c["prompt"], skill_name, desc, distractors, rng
-            )
+            try:
+                sel, k = judge_trigger(
+                    provider, c["prompt"], skill_name, desc, distractors, rng
+                )
+            except ModelTokenBudgetExceeded:
+                for pending in cases:
+                    selections.setdefault(pending["id"], None)
+                break
             selections[c["id"]] = sel
             n += k
         return selections, n
@@ -326,7 +332,8 @@ def run_trigger_verification(
     best_desc = description
     best_score = initial
     best_selections = selections
-    stopped_reason = ""
+    stopped_reason = "budget" if getattr(provider, "max_tokens_total", None) is not None \
+        and getattr(provider, "used_tokens", 0) >= provider.max_tokens_total else ""
     rounds = 0
 
     if initial["overall"] < threshold:
@@ -344,6 +351,9 @@ def run_trigger_verification(
                     provider, best_desc, failures, skill_name
                 )
                 calls += k
+            except ModelTokenBudgetExceeded:
+                stopped_reason = "budget"
+                break
             except TriggerError:
                 stopped_reason = "no_progress"
                 break

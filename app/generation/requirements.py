@@ -90,13 +90,14 @@ def extract_contract(
     open_questions = [str(q) for q in data.get("open_questions") or []]
 
     if return_meta:
+        usage = response.usage
         meta = {
             "prompt_version": PROMPT_VERSION,
             "model_calls": 1,
-            "usage": {
-                "prompt_tokens": response.usage.prompt_tokens,
-                "completion_tokens": response.usage.completion_tokens,
-            },
+            "usage": ({"prompt_tokens": usage.prompt_tokens,
+                       "completion_tokens": usage.completion_tokens}
+                      if usage is not None else None),
+            "usage_missing_calls": 0 if usage is not None else 1,
         }
         return contract.with_questions(open_questions), meta
     return contract.with_questions(open_questions)

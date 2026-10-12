@@ -55,7 +55,7 @@ from app.generation.requirements import (
 from app.generation.validation import validate_candidate
 from app.generation.versioning import FreezeError, freeze_candidate
 from app.llm import ProviderNotConfigured, provider_from_env
-from app.llm.usage import UsageTrackingProvider
+from app.llm.usage import ModelTokenBudgetExceeded, UsageTrackingProvider
 from app.models import GenerationFlow
 from app.services import queue
 from app.workers.handlers import HandlerContext, JobCancelled, payload_of, register
@@ -124,6 +124,15 @@ def handle(session, cfg, job, ctx: HandlerContext) -> dict:  # noqa: ANN001
         return {"outcome": "skipped_terminal", "flow_id": flow_id,
                 "state": snap.state.value}
 
+    token_cap = (snap.budget.max_tokens_total
+                 if snap.budget.max_tokens_total is not None
+                 else snap.budget.total_tokens)
+    if snap.budget.used_tokens >= token_cap:
+        message = f"全流程 token 预算已耗尽（{snap.budget.used_tokens}/{token_cap}），后续阶段未执行"
+        _mark_failed(session, flow_id, message)
+        return {"outcome": "budget_exceeded", "flow_id": flow_id,
+                "state": FlowState.FAILED.value, "error": message}
+
     # CAS 围栏基准：领取（读取快照）时刻的 revision
     start_revision = snap.revision
 
@@ -143,6 +152,27 @@ def handle(session, cfg, job, ctx: HandlerContext) -> dict:  # noqa: ANN001
     except ProviderNotConfigured as exc:
         _mark_failed(session, flow_id, f"模型提供商未配置: {exc}")
         raise
+    except ModelTokenBudgetExceeded as exc:
+        message = str(exc)
+        _mark_failed(session, flow_id, message)
+        return {"outcome": "budget_exceeded", "flow_id": flow_id,
+                "state": FlowState.FAILED.value, "error": message}
+
+
+def _budgeted_provider(snap: FlowSnapshot, stage: str, attempt_id: str) -> UsageTrackingProvider:
+    """Limit all calls in this stage by the remaining whole-flow token budget."""
+    cap = (snap.budget.max_tokens_total
+           if snap.budget.max_tokens_total is not None else snap.budget.total_tokens)
+    key = f"{stage}@{attempt_id}"
+    entry = (snap.checkpoint.get("budget_ledger") or {}).get(key, {})
+    # Only subtract an unsettled reservation. Once actual usage was recorded,
+    # retrying the same job attempt must not reclaim that already-spent budget.
+    reserved = int(entry.get("reserved") or 0) if entry.get("actual") is None else 0
+    already_used = max(0, snap.budget.used_tokens - reserved)
+    allowance = max(0, cap - already_used)
+    return UsageTrackingProvider(
+        provider_factory(), max_tokens_total=allowance,
+    )
 
 
 def _run_stage(session, cfg, ctx, row, snap: FlowSnapshot, stage: str,
@@ -182,7 +212,8 @@ def _run_repair_round(
     repair_attempt = f"{attempt_id}:repair-{round_no}"
     budget_svc.reserve_stage_budget(session, flow_id, stage_id, attempt_id=repair_attempt)
 
-    provider = UsageTrackingProvider(provider_factory())
+    snap = flow_store.get_flow(session, flow_id)
+    provider = _budgeted_provider(snap, stage_id, repair_attempt)
     try:
         repaired, meta = repair_candidate(
             provider, contract, profile, manifest, report,
@@ -234,7 +265,7 @@ def _stage_extract(session, cfg, ctx, row, snap: FlowSnapshot,
         meta = {"prompt_version": PROMPT_VERSION, "model_calls": 0,
                 "revised_by": "answers"}
     else:
-        provider = UsageTrackingProvider(provider_factory())
+        provider = _budgeted_provider(snap, "extract", attempt_id)
         if answers:
             request = {**request, "answers": answers}
         try:
@@ -301,7 +332,7 @@ def _stage_plan(session, cfg, ctx, snap: FlowSnapshot,
     if contract is None:
         raise PlanBuildError("快照缺少需求合同（流程损坏）")
     profile = snap.profile_snapshot or _profile(cfg)
-    provider = UsageTrackingProvider(provider_factory())
+    provider = _budgeted_provider(snap, "plan", attempt_id)
     try:
         plan, meta = build_skill_plan(provider, contract, profile, return_meta=True)
     except Exception:
@@ -364,7 +395,7 @@ def _stage_generate(session, cfg, ctx, row, snap: FlowSnapshot,
         manifest = ArtifactManifest.model_validate(repaired_manifest)
         meta = {"model_calls": 0, "usage": None, "via": "repair"}
     else:
-        provider = UsageTrackingProvider(provider_factory())
+        provider = _budgeted_provider(snap, "generate", attempt_id)
         try:
             manifest, meta = generate_candidate(
                 provider, contract, plan, profile, resources, return_meta=True

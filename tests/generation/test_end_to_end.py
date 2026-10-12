@@ -258,13 +258,15 @@ def test_request_to_delivered_package_and_all_negative_cases(
     # 模型失败 → 流程不得进入 delivered
     assert snap3["state"] != "delivered", "模型失败后绝不假装成功"
 
-    # ===== 块 E2：负例——预算超额如实报告，不停止也不假装免费 =====
+    # ===== 块 E2：预算上限约束后续阶段，超额如实记录 =====
     provider_ovf = ScriptedProvider([_contract_json(), _plan_json(), _file_json()])
     _use_provider(monkeypatch, provider_ovf)
 
     resp = client.post(
         f"/api/projects/{pid}/generation-flows",
-        json={"request_text": "小额预算需求", "budget": {"total_tokens": 100}},
+        json={"request_text": "小额预算需求", "budget": {
+            "total_tokens": 200_000, "max_tokens_total": 100,
+        }},
         headers=AUTH,
     )
     fid_ovf = resp.json()["flow_id"]
@@ -272,16 +274,12 @@ def test_request_to_delivered_package_and_all_negative_cases(
 
     snap_ovf = client.get(f"/api/generation-flows/{fid_ovf}", headers=AUTH).json()
     b = snap_ovf["budget"]
-    # 预算线是显式报告线：超额如实累计（预留额 300×3 ≫ 100），不钳制、不报 0
-    assert b["total_tokens"] == 100
-    assert b["used_tokens"] > 100, (
-        f"超额必须如实报告: used={b['used_tokens']} total={b['total_tokens']}"
-    )
-    assert b["used_model_calls"] >= 3, "每阶段至少计 1 次调用"
-    # 超额不是失败：流程状态如实反映生成结果本身，不因预算报告而误置 failed
-    assert snap_ovf["state"] == "delivered", (
-        f"小额预算但生成成功，状态应如实: {snap_ovf['state']}"
-    )
+    assert b["total_tokens"] == 200_000
+    assert b["max_tokens_total"] == 100
+    assert b["used_tokens"] >= 100
+    assert b["used_model_calls"] == 1, "额度耗尽后不得继续请求下一阶段"
+    assert snap_ovf["state"] == "failed"
+    assert "预算" in (snap_ovf.get("error") or "")
 
     # ===== 块 F：负例——篡改版本目录后导出 409 =====
     _use_provider(monkeypatch, provider2)

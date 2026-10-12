@@ -128,13 +128,14 @@ def build_skill_plan(
         raise PlanBuildError(f"模型方案结构非法: {exc}") from exc
 
     if return_meta:
+        usage = response.usage
         meta = {
             "prompt_version": PROMPT_VERSION,
             "model_calls": 1,
-            "usage": {
-                "prompt_tokens": response.usage.prompt_tokens,
-                "completion_tokens": response.usage.completion_tokens,
-            },
+            "usage": ({"prompt_tokens": usage.prompt_tokens,
+                       "completion_tokens": usage.completion_tokens}
+                      if usage is not None else None),
+            "usage_missing_calls": 0 if usage is not None else 1,
         }
         return plan, meta
     return plan

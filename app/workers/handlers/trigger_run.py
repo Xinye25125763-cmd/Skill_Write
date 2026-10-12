@@ -31,6 +31,7 @@ from app.generation.trigger import (
     run_trigger_verification,
 )
 from app.llm import ProviderNotConfigured, judge_provider_from_env
+from app.llm.usage import ModelTokenBudgetExceeded
 from app.models import EvalCaseResult, EvalRun, SkillVersion, Suite
 from app.services.skill_files import SkillFileService
 from app.workers.handlers import HandlerContext, payload_of, register
@@ -53,29 +54,49 @@ MAX_OPTIMIZATION_CHAIN_DEPTH = 1
 class _UsageTrackingProvider:
     """Accumulate provider usage across every trigger/judge/optimization call."""
 
-    def __init__(self, provider) -> None:  # noqa: ANN001
+    def __init__(self, provider, max_tokens_total: int | None = None) -> None:  # noqa: ANN001
         self.provider = provider
         self.capabilities = provider.capabilities
+        self.max_tokens_total = max_tokens_total
+        self.used_tokens = 0
+        self.unknown_usage_estimated_tokens = 0
         self.prompt_tokens = 0
         self.completion_tokens = 0
         self.usage_calls = 0
         self.unknown_calls = 0
         self.calls = 0
+        self.responses = 0
 
     def complete(self, messages, **kwargs):  # noqa: ANN001
+        if self.max_tokens_total is not None:
+            remaining = self.max_tokens_total - self.used_tokens
+            if remaining <= 0:
+                raise ModelTokenBudgetExceeded(
+                    f"全流程 token 预算已耗尽（触发验证，{self.used_tokens}/{self.max_tokens_total}）"
+                )
+            requested = kwargs.get("max_tokens")
+            kwargs["max_tokens"] = min(int(requested), remaining) if requested else remaining
         self.calls += 1
         try:
             response = self.provider.complete(messages, **kwargs)
         except Exception:
             self.unknown_calls += 1
+            estimate = max(0, int(kwargs.get("max_tokens") or 0))
+            self.unknown_usage_estimated_tokens += estimate
+            self.used_tokens += estimate
             raise
         usage = getattr(response, "usage", None)
+        self.responses += 1
         if usage is None:
             self.unknown_calls += 1
+            estimate = max(0, int(kwargs.get("max_tokens") or 0))
+            self.unknown_usage_estimated_tokens += estimate
+            self.used_tokens += estimate
         else:
             self.prompt_tokens += int(usage.prompt_tokens or 0)
             self.completion_tokens += int(usage.completion_tokens or 0)
             self.usage_calls += 1
+            self.used_tokens += int(usage.prompt_tokens or 0) + int(usage.completion_tokens or 0)
         return response
 
 
@@ -228,13 +249,20 @@ def handle(session, cfg, job, ctx: HandlerContext) -> dict:  # noqa: ANN001
     distractors = _collect_distractors(session, cfg, svc, project_id, version_id)
     ctx.event("start", f"触发验证：{version_id}（干扰项 {len(distractors)} 个）")
 
-    provider = _UsageTrackingProvider(provider_factory())
+    flow_id = row.generation_flow_id
+    flow_allowance = None
+    if flow_id:
+        flow_snap = budget_svc.flow_store.get_flow(session, flow_id)
+        token_cap = (flow_snap.budget.max_tokens_total
+                     if flow_snap.budget.max_tokens_total is not None
+                     else flow_snap.budget.total_tokens)
+        flow_allowance = max(0, token_cap - flow_snap.budget.used_tokens)
+    provider = _UsageTrackingProvider(provider_factory(), flow_allowance)
     result = run_trigger_verification(
         provider, skill_md, contract, distractors, rng=random.Random(),
     )
 
     # 预算记账（版本有生成流程才记；草稿版本跳过）
-    flow_id = row.generation_flow_id
     observed_usage = {
         "prompt_tokens": provider.prompt_tokens,
         "completion_tokens": provider.completion_tokens,
@@ -248,6 +276,15 @@ def handle(session, cfg, job, ctx: HandlerContext) -> dict:  # noqa: ANN001
         "usage_observed": observed_usage,
         "usage_calls": provider.usage_calls,
         "usage_missing_calls": provider.unknown_calls,
+        "unknown_usage_estimated_tokens": provider.unknown_usage_estimated_tokens,
+        "limit_tokens": provider.max_tokens_total,
+        "accounted_tokens": provider.used_tokens,
+        "over_limit": (provider.max_tokens_total is not None
+                       and provider.used_tokens > provider.max_tokens_total),
+        "overrun_tokens": (max(0, provider.used_tokens - provider.max_tokens_total)
+                           if provider.max_tokens_total is not None else 0),
+        "budget_exhausted": provider.max_tokens_total is not None
+            and provider.used_tokens >= provider.max_tokens_total,
     }
     if flow_id:
         try:
@@ -261,6 +298,14 @@ def handle(session, cfg, job, ctx: HandlerContext) -> dict:  # noqa: ANN001
         except Exception as exc:  # noqa: BLE001: persist explicit ledger error with trigger evidence
             session.rollback()
             result_meta["budget_ledger_error"] = f"{type(exc).__name__}: {exc}"
+
+    if provider.calls and provider.responses == 0:
+        # A failed provider request is not evidence that the skill failed
+        # routing. Keep its unknown cost in the flow ledger, but leave the
+        # trigger quality check as not_run instead of manufacturing negatives.
+        ctx.event("budget_exceeded", "触发验证请求未返回结果；已记账并停止后续调用")
+        return {"outcome": "not_run", "reason": "provider_failed_without_response",
+                "budget": result_meta}
 
     # 持久化：触发用例集 + EvalRun(kind=trigger) + 逐例结果
     cases_json = [

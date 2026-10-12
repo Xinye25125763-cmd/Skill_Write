@@ -2,6 +2,7 @@
 
 export interface FlowBudgetView {
   total_tokens?: number;
+  max_tokens_total?: number | null;
   used_tokens: number;
   used_model_calls: number;
   estimated_tokens?: number;

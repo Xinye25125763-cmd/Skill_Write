@@ -101,6 +101,7 @@ def generate_candidate(
     model_calls = 0
     prompt_tokens = 0
     completion_tokens = 0
+    usage_missing_calls = 0
 
     total = len(plan.files)
     for index, plan_file in enumerate(plan.files, start=1):
@@ -117,8 +118,11 @@ def generate_candidate(
         for attempt in range(MAX_REPAIR_ATTEMPTS + 1):
             response = provider.complete(messages)
             model_calls += 1
-            prompt_tokens += response.usage.prompt_tokens
-            completion_tokens += response.usage.completion_tokens
+            if response.usage is None:
+                usage_missing_calls += 1
+            else:
+                prompt_tokens += response.usage.prompt_tokens
+                completion_tokens += response.usage.completion_tokens
 
             if not _file_is_complete(response):
                 last_error = "模型响应被截断（finish_reason=length）"
@@ -195,7 +199,12 @@ def generate_candidate(
             "usage": {
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
+            } if not usage_missing_calls else None,
+            "usage_observed": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
             },
+            "usage_missing_calls": usage_missing_calls,
             "provider": type(provider).__name__,
         }
         return manifest, meta
