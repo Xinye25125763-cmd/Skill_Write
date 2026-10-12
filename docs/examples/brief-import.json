@@ -1,0 +1,72 @@
+{
+  "brief": {
+    "purpose": {
+      "value": "将个人周报素材整理成固定Markdown周报",
+      "source": {
+        "type": "user_message",
+        "ref": "当前请求"
+      }
+    },
+    "trigger_conditions": [
+      {
+        "value": "把我的周报素材整理成周报",
+        "source": {
+          "type": "user_message",
+          "ref": "当前请求"
+        }
+      }
+    ],
+    "non_trigger_conditions": [
+      {
+        "value": "只解释周报应该写什么",
+        "source": {
+          "type": "system_inferred",
+          "ref": "任务边界推断"
+        }
+      }
+    ],
+    "inputs": [
+      {
+        "name": "周报素材",
+        "format": "文本或Markdown",
+        "required": true,
+        "validation": "manual"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "weekly-report.md",
+        "format": "Markdown",
+        "required": true,
+        "validation": "file_exists + file_contains"
+      }
+    ],
+    "tools": [],
+    "constraints": [
+      {
+        "value": "不虚构进度和数据；不确定项明确标注",
+        "source": {
+          "type": "user_message",
+          "ref": "当前请求"
+        }
+      }
+    ],
+    "success_criteria": [
+      {
+        "value": "包含本周进展、问题、下周计划；事实可追溯到素材",
+        "source": {
+          "type": "system_inferred",
+          "ref": "验收建议"
+        }
+      }
+    ],
+    "target_platform": "codex",
+    "evaluation_preference": {
+      "objective_tests": true,
+      "subjective_scale": false
+    },
+    "unresolved": [
+      "周报是否需要个人固定模板"
+    ]
+  }
+}
