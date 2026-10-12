@@ -1,0 +1,67 @@
+# 默认工程规则（工程计划 §3 / T02 的解析对象）
+# 结构与 app/generation/contracts.EngineeringProfile 一一对应。
+# 纪律：这是"默认建议"层——真实系统/权限边界 > 用户明确要求 > 用户已确认规则 > 本文件。
+schema_version: "1"
+profile_id: default
+revision: 2
+rules:
+  - rule_id: SKILL_HEADER
+    revision: 1
+    severity: blocking
+    applies_to: SKILL.md
+    description: SKILL.md 必须含 name 与 description 头信息
+    checker_id: validation:skill_header
+  - rule_id: RESOURCE_REFERENCE
+    revision: 1
+    severity: blocking
+    applies_to: SKILL.md
+    description: 正文引用的 references/scripts/assets 文件必须存在于产物清单
+    checker_id: validation:resource_reference
+  - rule_id: FILE_HASH
+    revision: 1
+    severity: blocking
+    applies_to: "*"
+    description: 产物文件 sha256 与清单声明一致
+    checker_id: validation:file_hash
+  - rule_id: SCRIPT_SYNTAX
+    revision: 1
+    severity: blocking
+    applies_to: "*.py"
+    description: Python 脚本必须可编译（ast.parse）
+    checker_id: validation:script_syntax
+  - rule_id: COVERAGE
+    revision: 1
+    severity: blocking
+    applies_to: "*"
+    description: 每项必要需求功能必须有实现文件与验收项
+    checker_id: coverage:requirements
+  - rule_id: EVIDENCE_INTEGRITY
+    revision: 1
+    severity: blocking
+    applies_to: "*"
+    description: 检查报告必须有真实运行证据，未执行的检查只能标 not_run/unsupported
+    checker_id: ""
+  - rule_id: SKILL_SIZE_HINT
+    revision: 1
+    severity: warning
+    applies_to: SKILL.md
+    description: SKILL.md 建议 500 行以内（可覆盖）
+    checker_id: validation:skill_size
+    config:
+      max_lines: 500
+  - rule_id: NO_SECRETS
+    revision: 1
+    severity: blocking
+    applies_to: "*"
+    description: 产物不得包含会话令牌或模型密钥
+    checker_id: validation:no_secrets
+    config:
+      boundary: system
+  - rule_id: SCRIPT_SMOKE
+    revision: 1
+    severity: blocking
+    applies_to: "*.py,*.sh,*.ps1"
+    description: 脚本空输入 smoke：崩溃/超时即失败（不能优雅处理无输入的脚本不可交付）
+    checker_id: execution:script
+    config:
+      timeout_seconds: 10
